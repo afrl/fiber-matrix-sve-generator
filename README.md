@@ -37,6 +37,11 @@ For building documentation:
 pip install .[docs]
 ```
 
+For development (editable install with testing dependencies):
+```bash
+pip install -e ".[dev]"
+```
+
 ## Packaging
 
 To build the library as a `.whl` (wheel) file for distribution:
@@ -226,6 +231,50 @@ GitHub Pages.
 - `docs/`: Documentation source files.
 - `examples/`: Example scripts.
 
+## Troubleshooting
+
+### Headless VM / Docker / Cloud Workstations: `OSError: libGLU.so.1`
+
+When importing `fiber_matrix` (specifically its `gmsh` dependency) on a headless system, you may receive an error such as:
+```text
+OSError: libGLU.so.1: cannot open shared object file: No such file or directory
+```
+This occurs because `gmsh` relies on dynamic system graphics libraries even when running in headless mode. To resolve this issue, use one of the following options:
+
+#### Method 1: Install Mesa software-rendering libraries (Requires `sudo`)
+On Debian/Ubuntu-based cloud workstations or Docker containers, install the software-rendering Mesa libraries:
+```bash
+sudo apt-get update && sudo apt-get install -y libglu1-mesa libgl1
+```
+For extremely minimal environments, you may also need related X11/GL system components:
+```bash
+sudo apt-get update && sudo apt-get install -y \
+    libglu1-mesa \
+    libgl1-mesa-glx \
+    libxcursor1 \
+    libxinerama1 \
+    libxft2 \
+    libxrender1
+```
+
+#### Method 2: Force software rendering
+To prevent OpenGL errors on headless VMs, force CPU software rendering via environment variable:
+```bash
+export LIBGL_ALWAYS_SOFTWARE=1
+```
+Or set it programmatically in your Python script before importing `gmsh`:
+```python
+import os
+os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
+```
+
+#### Method 3: Use Conda (No `sudo` required)
+If you lack administrative privileges on the workstation, install `gmsh` via Conda. Conda packs precompiled headless-compatible versions of these graphic libraries directly within your user-space virtual environment:
+```bash
+conda install -c conda-forge gmsh
+```
+
 ## License
 
 [Apache 2.0](LICENSE)
+

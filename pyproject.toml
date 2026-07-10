@@ -29,6 +29,9 @@ docs = [
     "mkdocs-material",
     "mkdocstrings[python]",
 ]
+dev = [
+    "pytest",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
