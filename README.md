@@ -1,7 +1,5 @@
 # Fiber Matrix SVE Generator
 
-![Fiber Matrix Logo](docs/assets/logo.png)
-
 A Python library for generating Representative Volume Elements (RVEs) of fiber-reinforced composites. It handles random fiber placement, periodic boundary conditions, and generates high-quality unstructured meshes using [GMSH](https://gmsh.info/).
 
 ## Features
