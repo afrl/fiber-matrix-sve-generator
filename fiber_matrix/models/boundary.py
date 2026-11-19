@@ -1,4 +1,5 @@
 from enum import Enum
+import math
 import numpy as np
 from typing import List, Optional, Tuple
 
@@ -82,11 +83,20 @@ class LinearBoundary:
         bool
             True if the boundaries are geometric pairs (same length, parallel, opposite direction), False otherwise.
         """
-        if self.get_length() != other_boundary.get_length():
+        if other_boundary is self or not isinstance(other_boundary, LinearBoundary):
+            return False
+        len_self = self.get_length()
+        len_other = other_boundary.get_length()
+        if len_self <= 0 or len_other <= 0:
+            return False
+        tol = max(len_self * 1e-7, 1e-15)
+        if abs(len_self - len_other) > tol:
             return False
         vec1 = self.points[0] - other_boundary.points[1]
         vec2 = self.points[1] - other_boundary.points[0]
-        if np.linalg.norm(vec2 - vec1) > 1e-8:
+        if np.linalg.norm(vec1) <= tol:
+            return False
+        if np.linalg.norm(vec2 - vec1) > tol:
             return False
         return True
 
@@ -116,6 +126,15 @@ class LinearBoundary:
         z_vector = np.array([0.0, 0.0, 1.0])
         return np.cross(z_vector, segment_vector)[0:2]
 
+    def get_signed_distance(self, point: np.ndarray) -> float:
+        """Calculates signed perpendicular distance from the boundary line inward.
+
+        Positive values lie on the inward (left-hand) side of the boundary segment,
+        zero lies on the line, and negative values lie outside.
+        """
+        inward_normal = self.get_move_vector()
+        return float(np.dot(np.asarray(point, dtype=float) - self.points[0], inward_normal))
+
     def get_point_relative_position(self, point: np.ndarray) -> float:
         """Determines the position of a point relative to the boundary line.
 
@@ -128,17 +147,23 @@ class LinearBoundary:
         -------
         float
             Positive value if the point lies inside (to the left of the boundary vector),
-            negative if outside.
+            negative if outside, 0.0 if on the boundary.
         """
         segment_vector = self.points[1] - self.points[0]
         segment_vector_mag = np.linalg.norm(segment_vector)
+        if segment_vector_mag == 0:
+            return 0.0
         unit_segment_vector = segment_vector / segment_vector_mag
-        point_to_segment_start = point - self.points[0]
-        unit_point_to_segment_start = point_to_segment_start / np.linalg.norm(
-            point_to_segment_start
+        point_to_segment_start = np.asarray(point, dtype=float) - self.points[0]
+        pt_mag = np.linalg.norm(point_to_segment_start)
+        if pt_mag == 0:
+            return 0.0
+        unit_point_to_segment_start = point_to_segment_start / pt_mag
+        cross_product = (
+            unit_segment_vector[0] * unit_point_to_segment_start[1]
+            - unit_segment_vector[1] * unit_point_to_segment_start[0]
         )
-        cross_product = np.cross(unit_segment_vector, unit_point_to_segment_start)
-        return cross_product
+        return float(cross_product)
 
     def _closest_point_to_fiber(
         self, fiber_center: np.ndarray, within_boundary_segment=True
@@ -223,21 +248,30 @@ class LinearBoundary:
         )
         segment_vector = self.points[1] - self.points[0]
         segment_vector_mag = np.linalg.norm(segment_vector)
+        if segment_vector_mag == 0:
+            return []
         unit_segment_vector = segment_vector / segment_vector_mag
-        closest_to_center = fiber_center - closest_point
+        closest_to_center = np.asarray(fiber_center, dtype=float) - closest_point
         c = np.linalg.norm(closest_to_center)
-        if c == fiber_radius:
-            return [closest_point]
-        else:
-            ds = np.sqrt(fiber_radius**2 - c**2)
-            i1 = closest_point + ds * unit_segment_vector
-            i2 = closest_point - ds * unit_segment_vector
-            intersections = []
-            for p in [i1, i2]:
-                dot_product = np.dot(p - self.points[0], segment_vector)
-                if dot_product >= 0 and dot_product <= segment_vector_mag**2:
-                    intersections.append(p)
-            return intersections
+        tol = max(fiber_radius * 1e-12, 1e-15)
+        seg_tol = tol * segment_vector_mag
+        if c > fiber_radius + tol:
+            return []
+        if abs(c - fiber_radius) <= tol:
+            dot_product = np.dot(closest_point - self.points[0], segment_vector)
+            if -seg_tol <= dot_product <= segment_vector_mag**2 + seg_tol:
+                return [closest_point]
+            return []
+
+        ds = math.sqrt(max(0.0, fiber_radius**2 - c**2))
+        i1 = closest_point + ds * unit_segment_vector
+        i2 = closest_point - ds * unit_segment_vector
+        intersections = []
+        for p in [i1, i2]:
+            dot_product = np.dot(p - self.points[0], segment_vector)
+            if -seg_tol <= dot_product <= segment_vector_mag**2 + seg_tol:
+                intersections.append(p)
+        return intersections
 
 
 class BoundaryNode:

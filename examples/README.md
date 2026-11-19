@@ -6,26 +6,33 @@ root.
 
 All examples write files into `examples/output/`.
 
-## 2D RVE Examples
+## 2D RVE / SVE Examples
 
-Use these examples when you want a 2D fiber/matrix cross-section mesh.
+Use these examples when you want a 2D fiber/matrix cross-section microstructure and mesh:
 
 ```bash
 python examples/periodic_square_rve.py
 python examples/finite_square_rve.py
 python examples/periodic_hex_rve.py
 python examples/finite_hex_rve.py
+python examples/polydisperse_square_rve.py
+python examples/bimodal_hybrid_rve.py
+python examples/composite_ply_mixed_rve.py
+python examples/symmetric_unit_cell_rve.py
 ```
 
-Each script:
+To regenerate all 2D gallery figures and the relaxation GIF displayed in the root `README.md` (`docs/assets/gallery/`):
 
-- Initializes the selected RVE geometry.
-- Places fibers.
-- Solves fiber overlap/spacing.
+```bash
+python examples/generate_gallery.py
+```
+
+Each standalone 2D script:
+
+- Initializes the selected RVE/SVE geometry (`square`, `rectangular`, or `hexagonal`).
+- Places monodisperse, polydisperse, or bimodal fibers.
+- Solves fiber overlap and minimum spacing constraints under `PERIODIC`, `FINITE`, `SYMMETRIC`, or mixed per-edge boundaries.
 - Writes `.msh`, `.vtk`, and `.gif` files in `examples/output/`.
-
-The periodic examples create periodic boundary-compatible meshes. The finite
-examples keep fibers inside finite exterior boundaries.
 
 ## Direct 3D RVE Example
 

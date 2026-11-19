@@ -49,10 +49,13 @@ def draw_rve(
         print("Matplotlib not installed, skipping visualization.")
         return (None, None)
 
-    if fig is None:
-        fig = plt.figure()
-    if ax is None:
-        ax = plt.axes()
+    if fig is None and ax is None:
+        fig, ax = plt.subplots()
+    elif fig is None and ax is not None:
+        fig = ax.figure
+        ax.clear()
+    elif fig is not None and ax is None:
+        ax = fig.add_subplot(111)
     else:
         ax.clear()
 
@@ -73,7 +76,7 @@ def draw_rve(
     if frame is not None:
         if not os.path.exists("frames"):
             os.mkdir("frames")
-        plt.savefig(
+        fig.savefig(
             os.path.join("frames", str(frame) + "_RVE.png"),
             transparent=True,
             bbox_inches="tight",
@@ -133,7 +136,7 @@ def _draw_circle(center, radius, ax, label, color):
         )
     )
     if label:
-        plt.text(
+        ax.text(
             center[0] - radius / 3.0,
             center[1] - radius / 4.0,
             label,

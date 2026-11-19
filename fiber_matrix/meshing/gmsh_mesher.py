@@ -5,8 +5,10 @@ from scipy.spatial import KDTree
 
 try:
     import gmsh
-except ImportError:
+    _gmsh_import_error = None
+except (ImportError, OSError) as exc:
     gmsh = None
+    _gmsh_import_error = exc
 
 from fiber_matrix.models.boundary import LinearBoundary, BoundaryType
 from fiber_matrix.models.fiber import Fiber, PeriodicPrimaryFiber
@@ -34,9 +36,11 @@ class GmshMesher:
             If gmsh is not available.
         """
         if gmsh is None:
+            detail = f" ({_gmsh_import_error})" if _gmsh_import_error is not None else ""
             raise ImportError(
-                "GMSH python library is not installed. Please install it using 'pip install gmsh'."
-            )
+                "GMSH python library is not available or missing system shared libraries"
+                f"{detail}. Please install gmsh ('pip install gmsh') and required OpenGL/X11 libraries."
+            ) from _gmsh_import_error
 
     def create_mesh(
         self,
@@ -69,13 +73,31 @@ class GmshMesher:
         after boolean fragmenting and before mesh generation.
         """
 
+        if not boundaries:
+            raise ValueError("No boundaries provided.")
+
         gmsh.initialize()
+        try:
+            self._build_and_write_mesh(
+                fibers=fibers,
+                boundaries=boundaries,
+                mesh_size_factor=mesh_size_factor,
+                visualize_gui=visualize_gui,
+                check_periodicity=check_periodicity,
+            )
+        finally:
+            if gmsh.isInitialized():
+                gmsh.finalize()
+
+    def _build_and_write_mesh(
+        self,
+        fibers: List[PeriodicPrimaryFiber],
+        boundaries: List[LinearBoundary],
+        mesh_size_factor: float,
+        visualize_gui: bool,
+        check_periodicity: bool,
+    ):
         gmsh.model.add(self.mesh_name)
-
-        # Use OpenCASCADE kernel for robust boolean operations
-
-        # 1. Create RVE Polygon
-        # The boundaries might not be in order. We need to chain them.
 
         # Gather all points for scaling extent
         all_b_points = []
@@ -88,41 +110,40 @@ class GmshMesher:
         rve_extent = np.linalg.norm(
             np.max(all_b_points, axis=0) - np.min(all_b_points, axis=0)
         )
+        if rve_extent <= 0:
+            raise ValueError("RVE boundary extent must be positive.")
         scale_factor = 1.0 / rve_extent
 
         # Sort boundaries to form a continuous loop
         ordered_chain = []  # List of (LinearBoundary, start_point, end_point)
         remaining_boundaries = list(boundaries)
 
-        # Pick the first one
-        if not remaining_boundaries:
-            raise ValueError("No boundaries provided.")
-
         current_b = remaining_boundaries.pop(0)
-        # Orientation of the first one defines the loop direction
         current_start = current_b.points[0] * scale_factor
         current_end = current_b.points[1] * scale_factor
 
         ordered_chain.append((current_b, current_start, current_end))
 
-        # Iteratively find the next connected boundary
+        # Iteratively find the next connected boundary (closest endpoint within tolerance)
         while remaining_boundaries:
             found_idx = -1
             found_orientation = 0  # 0: p0->p1, 1: p1->p0
+            best_dist = 1e-4
 
             for i, b in enumerate(remaining_boundaries):
                 p0 = b.points[0] * scale_factor
                 p1 = b.points[1] * scale_factor
 
-                # Check connectivity to current_end
-                if np.linalg.norm(p0 - current_end) < 1e-4:
+                d0 = np.linalg.norm(p0 - current_end)
+                d1 = np.linalg.norm(p1 - current_end)
+                if d0 < best_dist:
+                    best_dist = d0
                     found_idx = i
                     found_orientation = 0
-                    break
-                elif np.linalg.norm(p1 - current_end) < 1e-4:
+                if d1 < best_dist:
+                    best_dist = d1
                     found_idx = i
                     found_orientation = 1
-                    break
 
             if found_idx == -1:
                 raise RuntimeError(
@@ -150,7 +171,6 @@ class GmshMesher:
 
         for i in range(len(ordered_chain)):
             item = ordered_chain[i]
-            # If last segment, connect to first point
             if i == len(ordered_chain) - 1:
                 next_pt_tag = first_pt_tag
             else:
@@ -166,6 +186,18 @@ class GmshMesher:
 
         # 2. Add Fibers (Disks)
         fiber_disks = []
+        coords_min = np.min(all_b_points, axis=0)
+        coords_max = np.max(all_b_points, axis=0)
+        max_r = max((f.radius for f in fibers), default=0.0)
+
+        def overlaps_bbox(f):
+            tol = f.radius * 1.05
+            return not (
+                f.center[0] < coords_min[0] - tol
+                or f.center[0] > coords_max[0] + tol
+                or f.center[1] < coords_min[1] - tol
+                or f.center[1] > coords_max[1] + tol
+            )
 
         def add_fiber_disk(f):
             return gmsh.model.occ.addDisk(
@@ -177,45 +209,47 @@ class GmshMesher:
             )
 
         for f in fibers:
-            fiber_disks.append(add_fiber_disk(f))
-            for g in f.ghost_fibers:
-                fiber_disks.append(add_fiber_disk(g))
+            if hasattr(f, "calc_ghost_fibers"):
+                f.calc_ghost_fibers(boundaries, max_fiber_radius=max_r)
+            if overlaps_bbox(f):
+                fiber_disks.append(add_fiber_disk(f))
+            for g in getattr(f, "ghost_fibers", []):
+                if overlaps_bbox(g):
+                    fiber_disks.append(add_fiber_disk(g))
 
         gmsh.model.occ.synchronize()
 
         if visualize_gui:
             gmsh.fltk.run()
-
-        # 3. Clip fibers to RVE using Intersect
-        # We want the part of fibers INSIDE the RVE.
-        # Object=Fibers, Tool=RVE
 
         rve_dimtag = (2, rve_face)
         fiber_dimtags = [(2, t) for t in fiber_disks]
 
-        # Intersect(Fibers, RVE). removeObject=True (consume fibers), removeTool=False (keep RVE).
-        clipped_fibers_dimtags, _ = gmsh.model.occ.intersect(
-            fiber_dimtags, [rve_dimtag], removeObject=True, removeTool=False
-        )
-
-        gmsh.model.occ.synchronize()
+        if fiber_dimtags:
+            clipped_fibers_dimtags, _ = gmsh.model.occ.intersect(
+                fiber_dimtags, [rve_dimtag], removeObject=True, removeTool=False
+            )
+            gmsh.model.occ.synchronize()
+        else:
+            clipped_fibers_dimtags = []
 
         if visualize_gui:
             gmsh.fltk.run()
 
-        # 4. Fragment
-        # Embed the clipped fibers into the RVE face.
-        out_dimtags, out_dimtags_map = gmsh.model.occ.fragment(
-            [rve_dimtag], clipped_fibers_dimtags
-        )
-
-        if not out_dimtags_map:
-            raise RuntimeError(
-                f"GMSH Fragment operation returned empty map. "
-                f"rve_dimtag={rve_dimtag}, # clipped_fibers={len(clipped_fibers_dimtags)}"
+        if clipped_fibers_dimtags:
+            out_dimtags, out_dimtags_map = gmsh.model.occ.fragment(
+                [rve_dimtag], clipped_fibers_dimtags
             )
+            if not out_dimtags_map:
+                raise RuntimeError(
+                    f"GMSH Fragment operation returned empty map. "
+                    f"rve_dimtag={rve_dimtag}, # clipped_fibers={len(clipped_fibers_dimtags)}"
+                )
+        else:
+            out_dimtags = [rve_dimtag]
+            out_dimtags_map = [[rve_dimtag]]
 
-        # Now that boolean operations are done, we can scale the geometry back to its original size.
+        # Scale the geometry back to its original size
         gmsh.model.occ.dilate(
             out_dimtags,
             0,
@@ -231,43 +265,32 @@ class GmshMesher:
             gmsh.fltk.run()
 
         # 5. Identify Matrix vs Fibers
-        # use out_dimtags_map from fragment operation to trace lineage.
-
-        # Collect all tags that come from the fiber inputs
         fiber_surface_tags = set()
-        # Inputs to fragment: [rve_dimtag] + clipped_fibers_dimtags
-        # Index 0 is RVE. Indices 1..N are Fibers.
-
         for i in range(len(clipped_fibers_dimtags)):
-            # Map index is 1 + i
             generated_dimtags = out_dimtags_map[1 + i]
             for dt in generated_dimtags:
-                fiber_surface_tags.add(dt[1])
+                if dt[0] == 2:
+                    fiber_surface_tags.add(dt[1])
 
-        # Collect all tags that come from the RVE input
-        rve_related_tags = set()
-        for dt in out_dimtags_map[0]:
-            rve_related_tags.add(dt[1])
+        rve_related_tags = {
+            dt[1] for dt in out_dimtags_map[0] if dt[0] == 2
+        }
 
-        # Matrix surfaces are those in RVE lineage that are NOT in Fiber lineage
         final_matrix_tags = list(rve_related_tags - fiber_surface_tags)
         final_fiber_tags = list(fiber_surface_tags)
 
         gmsh.model.occ.synchronize()
 
         # 6. Apply Periodic Conditions
-        # Re-fetch lines as they might have been split
         lines = gmsh.model.getEntities(1)
         boundary_line_map = {b: [] for b in boundaries}
 
-        # Calculate a relative tolerance for boundary matching based on RVE extent
-        boundary_dist_tolerance = rve_extent * 1e-8
+        boundary_dist_tolerance = max(rve_extent * 1e-7, 1e-15)
 
         for l in lines:
             tag = l[1]
             com = gmsh.model.occ.getCenterOfMass(1, tag)
-            for b_idx, b in enumerate(boundaries):
-                # Distance to segment
+            for b in boundaries:
                 dist = b.get_distance_to_fiber(np.array(com[:2]))
                 if dist < boundary_dist_tolerance:
                     boundary_line_map[b].append(tag)
@@ -278,9 +301,6 @@ class GmshMesher:
                     secondary_tags = boundary_line_map[b]
                     primary_tags = boundary_line_map[b.pair]
 
-                    # Simple translation vector from Primary to Secondary
-                    # P + T = S  => T = S - P
-                    # Let's take midpoint of boundary
                     mid_s = (b.points[0] + b.points[1]) / 2.0
                     mid_p = (b.pair.points[0] + b.pair.points[1]) / 2.0
                     trans = mid_s - mid_p
@@ -307,7 +327,7 @@ class GmshMesher:
                     if secondary_tags and primary_tags:
                         matched_secondary, matched_primary = (
                             self._get_periodic_boundary_mapping(
-                                secondary_tags, primary_tags, translation
+                                secondary_tags, primary_tags, translation, rve_extent
                             )
                         )
 
@@ -331,11 +351,13 @@ class GmshMesher:
                             )
 
         # 7. Physical Groups and Generation
-        p_matrix = gmsh.model.addPhysicalGroup(2, final_matrix_tags)
-        gmsh.model.setPhysicalName(2, p_matrix, "Matrix")
+        if final_matrix_tags:
+            p_matrix = gmsh.model.addPhysicalGroup(2, final_matrix_tags)
+            gmsh.model.setPhysicalName(2, p_matrix, "Matrix")
 
-        p_fibers = gmsh.model.addPhysicalGroup(2, final_fiber_tags)
-        gmsh.model.setPhysicalName(2, p_fibers, "Fibers")
+        if final_fiber_tags:
+            p_fibers = gmsh.model.addPhysicalGroup(2, final_fiber_tags)
+            gmsh.model.setPhysicalName(2, p_fibers, "Fibers")
 
         if mesh_size_factor:
             gmsh.model.mesh.setSize(gmsh.model.getEntities(0), mesh_size_factor)
@@ -349,11 +371,10 @@ class GmshMesher:
         gmsh.write(self.mesh_name + ".vtk")
 
         if check_periodicity:
+            periodicity_tol = max(rve_extent * 1e-6, 1e-15)
             self._check_periodicity(
-                boundaries, boundary_line_map, boundary_dist_tolerance
+                boundaries, boundary_line_map, periodicity_tol
             )
-
-        gmsh.finalize()
 
     def _is_inside_fiber(self, point_3d, fiber):
         """Checks if a point lies strictly inside a fiber (excluding boundary).
@@ -488,6 +509,7 @@ class GmshMesher:
         secondary_tags: List[int],
         primary_tags: List[int],
         translation: List[float],
+        rve_extent: float = 1.0,
     ) -> Tuple[List[int], List[int]]:
         """Finds a 1-to-1 mapping between secondary and primary curve segments based on CoM.
 
@@ -499,6 +521,8 @@ class GmshMesher:
             List of curve tags on the primary boundary.
         translation : List[float]
             The 16-element transformation matrix (GMSH format).
+        rve_extent : float, optional
+            Characteristic RVE size used to scale the matching tolerance.
 
         Returns
         -------
@@ -509,6 +533,7 @@ class GmshMesher:
         matched_primary = []
         remaining_primaries = list(primary_tags)
         trans_vec = np.array(translation[3:12:4])  # Extract [tx, ty, tz]
+        tolerance = max(rve_extent * 1e-5, 1e-15)
 
         # In GMSH: Secondary = Primary + Translation, so Primary = Secondary - Translation
         for s_tag in secondary_tags:
@@ -516,7 +541,7 @@ class GmshMesher:
             expected_p_com = s_com - trans_vec
 
             best_idx = -1
-            min_dist = 1e-6  # Tolerance
+            min_dist = tolerance
 
             for i, p_tag in enumerate(remaining_primaries):
                 p_com = np.array(gmsh.model.occ.getCenterOfMass(1, p_tag))

@@ -1,7 +1,6 @@
 import math
-import random
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Sequence, Union
 from pathlib import Path
 
 try:
@@ -40,6 +39,58 @@ class FiberRVE:
     # Initialization
     # ---------------------
 
+    @staticmethod
+    def _sample_radii(
+        num_fibers: int,
+        avg_diam: float,
+        diam_std_dev: float,
+        radii: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        if radii is not None:
+            if len(radii) < 1:
+                raise ValueError("radii must contain at least one fiber radius.")
+            parsed = [float(r) for r in radii]
+            if any(r <= 0.0 for r in parsed):
+                raise ValueError("All fiber radii must be strictly positive.")
+            return parsed
+
+        if num_fibers < 1:
+            raise ValueError("num_fibers must be at least 1.")
+        if avg_diam <= 0.0:
+            raise ValueError("avg_diam must be strictly positive.")
+        if diam_std_dev < 0.0:
+            raise ValueError("diam_std_dev must be non-negative.")
+
+        min_diam = 0.05 * avg_diam
+        diams = diam_std_dev * avg_diam * np.random.randn(num_fibers) + avg_diam
+        if diam_std_dev > 0.0:
+            for idx in range(num_fibers):
+                attempts = 0
+                while diams[idx] < min_diam and attempts < 1000:
+                    diams[idx] = (
+                        diam_std_dev * avg_diam * float(np.random.randn()) + avg_diam
+                    )
+                    attempts += 1
+                if diams[idx] < min_diam:
+                    diams[idx] = min_diam
+        return [float(d) / 2.0 for d in diams]
+
+    @staticmethod
+    def _resolve_boundary_types(
+        boundary_type: Union[BoundaryType, Sequence[BoundaryType]],
+        num_edges: int,
+    ) -> List[BoundaryType]:
+        if isinstance(boundary_type, BoundaryType):
+            return [boundary_type for _ in range(num_edges)]
+        btypes = list(boundary_type)
+        if len(btypes) != num_edges:
+            raise ValueError(
+                f"Expected {num_edges} boundary types, got {len(btypes)}."
+            )
+        if not all(isinstance(bt, BoundaryType) for bt in btypes):
+            raise ValueError("All boundary_type entries must be BoundaryType values.")
+        return btypes
+
     def initialize_rectangle_rve(
         self,
         num_fibers: int,
@@ -48,16 +99,17 @@ class FiberRVE:
         diam_std_dev: float = 0.0,
         rve_aspect_ratio: float = 1.0,
         fixed_height: Optional[float] = None,
-        boundary_type: BoundaryType = BoundaryType.PERIODIC,
+        boundary_type: Union[BoundaryType, Sequence[BoundaryType]] = BoundaryType.PERIODIC,
+        radii: Optional[Sequence[float]] = None,
     ) -> List[float]:
         """Calculates dimensions of the RVE and generates fiber radii distribution.
 
         Parameters
         ----------
         num_fibers : int
-            Target number of fibers.
+            Target number of fibers (ignored if ``radii`` is explicitly provided).
         vf : float, optional
-            Target fiber volume fraction. Default 0.6.
+            Target fiber volume fraction in (0, 1). Default 0.6.
         avg_diam : float, optional
             Average fiber diameter. Default 5e-6.
         diam_std_dev : float, optional
@@ -66,17 +118,28 @@ class FiberRVE:
             Ratio of width to height (w/h). Default 1.0.
         fixed_height : float, optional
             If provided, fixes RVE height and calculates width to satisfy VF.
+        boundary_type : BoundaryType or Sequence[BoundaryType], optional
+            Single boundary type applied to all 4 edges, or a 4-element sequence
+            for [bottom, right, top, left]. Default PERIODIC.
+        radii : Sequence[float], optional
+            Explicit fiber radii (e.g. for bimodal or custom size distributions).
 
         Returns
         -------
         List[float]
             The calculated RVE dimensions [width, height].
         """
+        if not (0.0 < vf < 1.0):
+            raise ValueError("vf must be strictly between 0 and 1.")
+        if fixed_height is None:
+            if rve_aspect_ratio <= 0.0:
+                raise ValueError("rve_aspect_ratio must be strictly positive.")
+        elif fixed_height <= 0.0:
+            raise ValueError("fixed_height must be strictly positive.")
 
-        self.radii = [
-            a / 2
-            for a in diam_std_dev * avg_diam * np.random.randn(num_fibers) + avg_diam
-        ]
+        self.fibers = []
+        self.fiber_vf = 0.0
+        self.radii = self._sample_radii(num_fibers, avg_diam, diam_std_dev, radii=radii)
         total_fiber_area = sum([math.pi * a * a for a in self.radii])
         rve_area = total_fiber_area / vf
 
@@ -93,7 +156,7 @@ class FiberRVE:
             np.array([w, h]),
             np.array([0.0, h]),
         ]
-        boundary_types = [boundary_type for _ in boundary_points]
+        boundary_types = self._resolve_boundary_types(boundary_type, len(boundary_points))
         self._create_boundaries_from_points(boundary_points, boundary_types)
 
         return self.rve_dims
@@ -104,32 +167,38 @@ class FiberRVE:
         vf: float = 0.6,
         avg_diam: float = 5e-6,
         diam_std_dev: float = 0.0,
-        boundary_type: BoundaryType = BoundaryType.PERIODIC,
+        boundary_type: Union[BoundaryType, Sequence[BoundaryType]] = BoundaryType.PERIODIC,
+        radii: Optional[Sequence[float]] = None,
     ) -> List[float]:
         """Calculates dimensions and initializes a regular hexagonal RVE.
 
         Parameters
         ----------
         num_fibers : int
-            Target number of fibers.
+            Target number of fibers (ignored if ``radii`` is explicitly provided).
         vf : float, optional
-            Target fiber volume fraction. Default 0.6.
+            Target fiber volume fraction in (0, 1). Default 0.6.
         avg_diam : float, optional
             Average fiber diameter. Default 5e-6.
         diam_std_dev : float, optional
             Standard deviation of fiber diameter. Default 0.0.
-        boundary_type : BoundaryType, optional
-            Type of boundary to apply to all edges. Default PERIODIC.
+        boundary_type : BoundaryType or Sequence[BoundaryType], optional
+            Single boundary type applied to all 6 edges, or a 6-element sequence.
+            Default PERIODIC.
+        radii : Sequence[float], optional
+            Explicit fiber radii (e.g. for bimodal or custom size distributions).
 
         Returns
         -------
         List[float]
             The side length of the hexagon [side_length].
         """
-        self.radii = [
-            a / 2
-            for a in diam_std_dev * avg_diam * np.random.randn(num_fibers) + avg_diam
-        ]
+        if not (0.0 < vf < 1.0):
+            raise ValueError("vf must be strictly between 0 and 1.")
+
+        self.fibers = []
+        self.fiber_vf = 0.0
+        self.radii = self._sample_radii(num_fibers, avg_diam, diam_std_dev, radii=radii)
         total_fiber_area = sum([math.pi * a * a for a in self.radii])
         rve_area = total_fiber_area / vf
 
@@ -137,14 +206,7 @@ class FiberRVE:
         s = math.sqrt(2.0 * rve_area / (3.0 * math.sqrt(3.0)))
         self.rve_dims = [s]
 
-        # Vertices for a "flat-topped" hexagon
-        # V0 = [s, 0]
-        # V1 = [s/2, s*sqrt(3)/2]
-        # V2 = [-s/2, s*sqrt(3)/2]
-        # V3 = [-s, 0]
-        # V4 = [-s/2, -s*sqrt(3)/2]
-        # V5 = [s/2, -s*sqrt(3)/2]
-        # We offset so V4 is roughly at origin-ish area if needed, but [0,0] center is cleaner.
+        # Vertices for a "flat-topped" hexagon centered at [0, 0]
         h_val = s * math.sqrt(3.0) / 2.0
         boundary_points = [
             np.array([s, 0.0]),
@@ -154,9 +216,66 @@ class FiberRVE:
             np.array([-s / 2.0, -h_val]),
             np.array([s / 2.0, -h_val]),
         ]
-        boundary_types = [boundary_type for _ in boundary_points]
+        boundary_types = self._resolve_boundary_types(boundary_type, len(boundary_points))
         self._create_boundaries_from_points(boundary_points, boundary_types)
 
+        return self.rve_dims
+
+    def initialize_polygon_rve(
+        self,
+        vertices: Sequence[Sequence[float]],
+        num_fibers: int = 1,
+        vf: Optional[float] = 0.5,
+        avg_diam: float = 5e-6,
+        diam_std_dev: float = 0.0,
+        boundary_type: Union[BoundaryType, Sequence[BoundaryType]] = BoundaryType.FINITE,
+        radii: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """Initializes an RVE from an arbitrary simple polygon.
+
+        Vertices are automatically oriented counter-clockwise so inward normals
+        point into the domain. If ``vf`` is provided, the polygon is uniformly
+        scaled about its centroid so the fiber area fraction equals ``vf``.
+        If ``vf`` is ``None``, the supplied vertex coordinates are used directly.
+        """
+        pts = [np.asarray(v, dtype=float).copy() for v in vertices]
+        if len(pts) < 3:
+            raise ValueError("Polygon RVE requires at least 3 vertices.")
+        if any(p.shape != (2,) for p in pts):
+            raise ValueError("Each polygon vertex must be a 2D coordinate [x, y].")
+
+        n_pts = len(pts)
+        signed_area = 0.5 * sum(
+            pts[i][0] * pts[(i + 1) % n_pts][1] - pts[(i + 1) % n_pts][0] * pts[i][1]
+            for i in range(n_pts)
+        )
+        if abs(signed_area) <= 1e-18:
+            raise ValueError("Polygon vertices have zero area.")
+
+        btypes = self._resolve_boundary_types(boundary_type, n_pts)
+        if signed_area < 0:
+            # Reverse vertex order to CCW while keeping edge-to-boundary-type correspondence
+            pts = [pts[0]] + list(reversed(pts[1:]))
+            btypes = list(reversed(btypes))
+            signed_area = -signed_area
+
+        self.fibers = []
+        self.fiber_vf = 0.0
+        self.radii = self._sample_radii(num_fibers, avg_diam, diam_std_dev, radii=radii)
+        total_fiber_area = sum(math.pi * r * r for r in self.radii)
+
+        if vf is not None:
+            if not (0.0 < vf < 1.0):
+                raise ValueError("vf must be strictly between 0 and 1.")
+            target_area = total_fiber_area / vf
+            scale = math.sqrt(target_area / signed_area)
+            centroid = sum(pts) / float(n_pts)
+            pts = [centroid + scale * (p - centroid) for p in pts]
+
+        arr_pts = np.array(pts)
+        extents = np.max(arr_pts, axis=0) - np.min(arr_pts, axis=0)
+        self.rve_dims = [float(extents[0]), float(extents[1])]
+        self._create_boundaries_from_points(pts, btypes)
         return self.rve_dims
 
     def _create_boundaries_from_points(
@@ -228,8 +347,11 @@ class FiberRVE:
         Tuple[float, float]
             Actual Fiber Volume Fraction (VF) and Total RVE Area.
         """
-        if specified_fiber_centers is None:
-            specified_fiber_centers = []
+        centers = (
+            list(specified_fiber_centers)
+            if specified_fiber_centers is not None
+            else []
+        )
 
         points = np.array(self.boundary_points)
         if len(points) < 3:
@@ -257,7 +379,9 @@ class FiberRVE:
             plt.show()
 
         def get_tri_area(a, b, c):
-            return 0.5 * np.linalg.norm(np.cross(b - a, c - a))
+            return 0.5 * abs(
+                float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+            )
 
         areas = []
         total_weighted_centroid = np.array([0.0, 0.0])
@@ -274,8 +398,8 @@ class FiberRVE:
 
         def weighted_choice(choices, weights):
             total = sum(weights)
-            r = random.uniform(0, total)
-            upto = 0
+            r = float(np.random.uniform(0.0, total))
+            upto = 0.0
             for i, w in enumerate(weights):
                 if upto + w >= r:
                     return choices[i]
@@ -285,9 +409,17 @@ class FiberRVE:
         self.fibers = []
         num_fibers = len(self.radii)
 
-        if not specified_fiber_centers:
+        if num_fibers == 0:
+            self.fiber_vf = 0.0
+            return (0.0, rve_area)
+
+        if not centers:
             if num_fibers == 1:
-                specified_fiber_centers.append(centroid.tolist())
+                self.fibers.append(
+                    PeriodicPrimaryFiber(
+                        centroid.copy(), self.radii[0], 0, self.boundaries
+                    )
+                )
             else:
                 # Random placement within triangles
                 choice_indices = list(range(len(areas)))
@@ -312,46 +444,56 @@ class FiberRVE:
                         )
                     )
         else:
-            if len(specified_fiber_centers) != num_fibers:
+            if len(centers) != num_fibers:
                 raise ValueError(
-                    f"Number of specified centers ({len(specified_fiber_centers)}) "
+                    f"Number of specified centers ({len(centers)}) "
                     f"does not match number of fibers ({num_fibers})."
                 )
             for i in range(num_fibers):
                 self.fibers.append(
                     PeriodicPrimaryFiber(
-                        np.array(specified_fiber_centers[i]),
+                        np.array(centers[i], dtype=float),
                         self.radii[i],
                         i,
                         self.boundaries,
                     )
                 )
 
+        max_r = max((f.radius for f in self.fibers), default=0.0)
         for fiber in self.fibers:
             fiber.adjust_for_bounds(self.boundaries)
+            fiber.calc_ghost_fibers(self.boundaries, max_fiber_radius=max_r)
 
         self.fiber_vf = sum([math.pi * r**2 for r in self.radii]) / rve_area
         return (self.fiber_vf, rve_area)
 
     def is_inside_rve(self, point: np.ndarray) -> bool:
-        """Checks if a point is strictly inside the RVE boundaries."""
+        """Checks if a point lies inside (or on) the RVE boundaries."""
+        if not self.boundaries:
+            return False
+        pt = np.asarray(point, dtype=float)
         for b in self.boundaries:
-            # Vector from p0 to p1
-            v1 = b.points[1] - b.points[0]
-            # Vector from p0 to point
-            v2 = point - b.points[0]
-            # 2D Cross product: x1*y2 - x2*y1
-            cross = v1[0] * v2[1] - v1[1] * v2[0]
-            if cross < -1e-12:
-                return False
-        return True
+            tol = max(b.get_length() * 1e-12, 1e-15)
+            if b.get_distance_to_fiber(pt) <= tol:
+                return True
+
+        inside = False
+        x, y = float(pt[0]), float(pt[1])
+        for b in self.boundaries:
+            x0, y0 = float(b.points[0][0]), float(b.points[0][1])
+            x1, y1 = float(b.points[1][0]), float(b.points[1][1])
+            if (y0 > y) != (y1 > y):
+                x_intersect = x0 + (y - y0) * (x1 - x0) / (y1 - y0)
+                if x < x_intersect:
+                    inside = not inside
+        return inside
 
     def solve_fiber_locations(
         self,
         min_spacing_ratio: float,
         visualization_path: Optional[str] = None,
         show_final: bool = False,
-        iterations_max: int = 100,
+        iterations_max: int = 1000,
     ):
         """Executes the solver to resolve fiber overlaps and enforce spacing.
 
@@ -363,6 +505,8 @@ class FiberRVE:
             If provided, saves an animation of the solution process to the given path. Default None.
         show_final : bool, optional
             If True, displays the final RVE plot to screen. Default False.
+        iterations_max : int, optional
+            Maximum number of solver iterations. Default 1000.
         """
         if not self.fibers:
             self.place_initial_fibers()
@@ -373,6 +517,7 @@ class FiberRVE:
         captured_frames = []
         fig = None
         ax = None
+        callback = None
 
         if visualization_path and plt is not None:
             # Create a single figure for the animation
@@ -421,13 +566,15 @@ class FiberRVE:
                 iteration_callback=callback,
                 iterations_max=iterations_max,
             )
-            return iterations
         finally:
             # Save GIF if we have frames
             if captured_frames:
                 try:
+                    out_path = Path(visualization_path)
+                    if out_path.parent and str(out_path.parent) != ".":
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
                     captured_frames[0].save(
-                        visualization_path,
+                        out_path,
                         save_all=True,
                         append_images=captured_frames[1:],
                         optimize=False,
@@ -446,6 +593,8 @@ class FiberRVE:
 
         if show_final:
             self.draw()
+
+        return iterations
 
     def get_fiber_centers(self) -> List[np.ndarray]:
         """Returns the current centers of all primary fibers.

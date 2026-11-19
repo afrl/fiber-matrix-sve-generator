@@ -7,29 +7,78 @@ A Python library for generating Representative Volume Elements (RVEs) of fiber-r
 ## Features
 
 - **Geometric Generation**:
-  - Random fiber placement with overlap resolution.
-  - Periodic boundary condition enforcement (ghost fibers).
-  - Customizable fiber radius, volume fraction, and RVE dimensions.
+  - Random or user-specified fiber placement with deterministic overlap resolution (`np.random.seed`).
+  - Square, rectangular, regular hexagonal, and arbitrary simple polygon RVE/SVE domains.
+  - Periodic (ghost fibers + corner periodic images), finite wall, reflection-symmetric, and per-edge mixed boundary conditions.
+  - Monodisperse, Gaussian polydisperse, and custom/bimodal hybrid fiber radius distributions.
 - **Robust Meshing**:
-  - Unstructured meshing via GMSH Python API.
-  - Robust boolean operations (Cut/Intersect) handling periodic boundaries.
-  - 2D surface meshes and extruded 3D volume meshes.
-  - Automatic physical group tagging for Matrix, Fibers, and optional material-specific 3D boundary surfaces.
+  - Unstructured meshing via GMSH Python API with OpenCASCADE boolean fragmentation.
+  - 2D surface meshes and extruded 3D volume meshes (tetrahedral or recombined prism/wedge elements) with periodic node verification (`KDTree`).
+  - Automatic physical group tagging for `Matrix`, `Fibers`, optional material-specific or composite 3D boundary surfaces, and mechanical 3D anchor nodes.
 - **Visualization**:
-  - Real-time visualization of fiber packing convergence.
-  - Matplotlib plotting of RVE geometry.
+  - Animated GIF export of iterative fiber-packing relaxation.
+  - Matplotlib plotting of RVE geometry, periodic ghost fibers, and boundary types.
+
+## Microstructure & Mesh Gallery
+
+All gallery figures below are generated reproducibly by [`examples/generate_gallery.py`](examples/generate_gallery.py) using the standalone scripts in [`examples/`](examples/).
+
+![2D Microstructure & Mesh Gallery Overview](docs/assets/gallery/gallery_overview.png)
+
+### 1. Periodic Square High-VF SVE (`VF = 60%`)
+Dense unidirectional fiber packing with 2-axis periodic boundary conditions, corner ghost fibers, and verified 1-to-1 periodic boundary mesh nodes.
+- **Example script:** [`examples/periodic_square_rve.py`](examples/periodic_square_rve.py)
+
+![Periodic Square High-VF SVE](docs/assets/gallery/periodic_square_sve.png)
+
+### 2. Periodic Hexagonal SVE (`VF = 50%`)
+Flat-topped regular hexagonal SVE enforcing 3-axis periodic pairing across all six edges.
+- **Example script:** [`examples/periodic_hex_rve.py`](examples/periodic_hex_rve.py)
+
+![Periodic Hexagonal SVE](docs/assets/gallery/periodic_hexagonal_sve.png)
+
+### 3. Polydisperse Variable-Diameter SVE (`CoV = 22%`, `VF = 52%`)
+Gaussian-distributed fiber diameters with radius-aware `KDTree` neighbor queries and periodic boundary matching.
+- **Example script:** [`examples/polydisperse_square_rve.py`](examples/polydisperse_square_rve.py)
+
+![Polydisperse Variable-Diameter SVE](docs/assets/gallery/polydisperse_sve.png)
+
+### 4. Bimodal Hybrid Composite SVE (`VF = 55%`)
+Hybrid reinforcement combining coarse primary structural fibers and fine interstitial fibers via explicit `radii` specification.
+- **Example script:** [`examples/bimodal_hybrid_rve.py`](examples/bimodal_hybrid_rve.py)
+
+![Bimodal Hybrid Composite SVE](docs/assets/gallery/bimodal_hybrid_sve.png)
+
+### 5. Composite Ply Mixed-Boundary SVE (`VF = 48%`)
+Thin composite ply cross-section combining `PERIODIC` lateral boundaries (along ply width) with `FINITE` resin-rich top and bottom ply surfaces.
+- **Example script:** [`examples/composite_ply_mixed_rve.py`](examples/composite_ply_mixed_rve.py)
+
+![Composite Ply Mixed-Boundary SVE](docs/assets/gallery/composite_ply_mixed_sve.png)
+
+### 6. Symmetric Mirror-Plane Sub-Cell SVE
+Reflection-symmetric unit/sub-cell (`BoundaryType.SYMMETRIC`) supporting quarter-fibers at corners, half-fibers centered on symmetry planes, and interior fibers.
+- **Example script:** [`examples/symmetric_unit_cell_rve.py`](examples/symmetric_unit_cell_rve.py)
+
+![Symmetric Mirror-Plane Sub-Cell SVE](docs/assets/gallery/symmetric_sve.png)
+
+### Iterative Overlap-Resolution Animation
+During `solve_fiber_locations`, overlapping random placements are iteratively relaxed while enforcing minimum inter-fiber spacing and periodic/wall constraints:
+
+<p align="center">
+  <img src="docs/assets/gallery/packing_relaxation.gif" alt="Iterative Fiber Packing Relaxation" width="460" />
+</p>
 
 ## Installation
 
 ### Prerequisites
 
 - Python 3.8+
-- [GMSH SDK](https://gmsh.info/) (usually installed via pip)
+- [GMSH SDK](https://gmsh.info/) (installed via `pip`)
 
 ### Install Dependencies
 
 ```bash
-pip install numpy scipy matplotlib gmsh
+pip install -r requirements.txt
 ```
 
 For building documentation:
@@ -79,8 +128,8 @@ rve.initialize_rectangle_rve(
 # 2. Place Fibers (Solve for non-overlapping configuration)
 print("Solving fiber placement...")
 iterations = rve.solve_fiber_locations(
-    min_spacing_ratio=0.05, 
-    visualize=True  # Save frames of the packing process
+    min_spacing_ratio=0.05,
+    visualization_path="my_composite_rve.gif",  # Optional GIF of packing relaxation
 )
 print(f"Solved in {iterations} iterations.")
 

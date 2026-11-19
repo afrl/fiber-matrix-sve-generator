@@ -72,15 +72,18 @@ class Fiber:
         overlap_found = False
         # Sort neighbors for deterministic behavior
         sorted_neighbors = sorted(
-            list(self.neighbors), key=lambda f: f.center[0]
-        )  # Simple sort by x-coordinate
+            list(self.neighbors), key=lambda f: (float(f.center[0]), float(f.center[1]))
+        )
         for nf in sorted_neighbors:
             vec_to_other = self.get_vector_to_other(nf)
             dist = np.linalg.norm(vec_to_other)
             sum_radii = self.radius + nf.radius
             if dist < sum_radii + min_space_between_fibers:
                 overlap_found = True
-                unit_vec_to_other = vec_to_other / dist
+                if dist < 1e-15:
+                    unit_vec_to_other = np.array([1.0, 0.0])
+                else:
+                    unit_vec_to_other = vec_to_other / dist
                 proportion_to_move_this_fiber = nf.radius / sum_radii
                 proportion_to_move_other_fiber = 1.0 - proportion_to_move_this_fiber
                 total_move_back = (
@@ -104,34 +107,36 @@ class Fiber:
         """Checks to make sure this fiber does not violate any specified boundaries
         and will move it if necessary.
         """
+        target_dist = (1.0 + eps) * self.radius
         for boundary in boundaries:
-            if boundary.type == BoundaryType.FINITE and boundary.check_collision(
-                self.center, self.radius, eps
-            ):
-                move_vector = boundary.get_move_vector()
-                distance_to_center = boundary.get_distance_to_fiber(self.center)
-                self.center = (
-                    self.center
-                    + abs(distance_to_center - (1.0 + eps) * self.radius) * move_vector
-                )
+            if boundary.type not in (BoundaryType.FINITE, BoundaryType.SYMMETRIC):
+                continue
 
-            if boundary.type == BoundaryType.SYMMETRIC and boundary.check_collision(
-                self.center, self.radius, eps
+            seg_vec = boundary.points[1] - boundary.points[0]
+            seg_len = boundary.get_length()
+            if seg_len <= 0:
+                continue
+
+            signed_dist = boundary.get_signed_distance(self.center)
+            proj = float(np.dot(self.center - boundary.points[0], seg_vec) / seg_len)
+            within_span = -self.radius <= proj <= seg_len + self.radius
+
+            if not (
+                boundary.check_collision(self.center, self.radius, eps)
+                or (signed_dist < 0.0 and within_span)
             ):
-                move_vector = boundary.get_move_vector()
-                distance_to_center = boundary.get_distance_to_fiber(self.center)
-                if distance_to_center < self.radius / 2.0:
-                    self.center = (
-                        self.center
-                        - abs(distance_to_center - (1.0 + eps) * self.radius)
-                        * move_vector
-                    )
-                else:
-                    self.center = (
-                        self.center
-                        + abs(distance_to_center - (1.0 + eps) * self.radius)
-                        * move_vector
-                    )
+                continue
+
+            move_vector = boundary.get_move_vector()
+            if boundary.type == BoundaryType.FINITE:
+                if signed_dist < target_dist:
+                    self.move((target_dist - signed_dist) * move_vector)
+            elif boundary.type == BoundaryType.SYMMETRIC:
+                if signed_dist < self.radius / 2.0:
+                    if abs(signed_dist) > max(self.radius * 1e-12, 1e-15):
+                        self.move(-signed_dist * move_vector)
+                elif signed_dist < target_dist:
+                    self.move((target_dist - signed_dist) * move_vector)
 
 
 class PeriodicPrimaryFiber(Fiber):
@@ -152,42 +157,83 @@ class PeriodicPrimaryFiber(Fiber):
         if boundaries is not None:
             self.calc_ghost_fibers(boundaries)
 
-    def calc_ghost_fibers(self, boundaries: List[LinearBoundary]):
+    def calc_ghost_fibers(
+        self,
+        boundaries: List[LinearBoundary],
+        max_fiber_radius: Optional[float] = None,
+    ):
         self.ghost_fibers = []
         if self.ignore_ghost_fibers:
             return
 
-        ghost_centers = []
-        for boundary in boundaries:
-            if boundary.type == BoundaryType.PERIODIC:
-                # Need to use the boundary check logic here
-                # accessing helper method on boundary to get distance
-                if boundary.get_distance_to_fiber(self.center) < 3.0 * self.radius:
-                    ghost_center = self.center + boundary.get_periodic_vector()
-                    ghost_centers.append(ghost_center)
+        ref_radius = (
+            max(self.radius, max_fiber_radius)
+            if max_fiber_radius is not None
+            else self.radius
+        )
+        search_threshold = 3.0 * ref_radius
+        dedup_tol = max(self.radius * 1e-6, 1e-15)
 
-        # Check intersection with multiple periodic boundaries (corner cases)
-        intersected_periodic = []
+        first_pass = []
         for boundary in boundaries:
-            if boundary.type == BoundaryType.PERIODIC and boundary.check_collision(
-                self.center, self.radius
+            if boundary.type == BoundaryType.PERIODIC and boundary.pair is not None:
+                pvec = boundary.get_periodic_vector()
+                if pvec is None:
+                    continue
+                if (
+                    boundary.get_distance_to_fiber(self.center) < search_threshold
+                    or boundary.get_signed_distance(self.center) < 0.0
+                ):
+                    first_pass.append((boundary, self.center + pvec))
+
+        candidate_centers = [center for _, center in first_pass]
+
+        # Second pass for multi-boundary / corner periodic images
+        for b1, c1 in first_pass:
+            for b2 in boundaries:
+                if (
+                    b2.type == BoundaryType.PERIODIC
+                    and b2.pair is not None
+                    and b2 is not b1
+                    and b2 is not b1.pair
+                ):
+                    pvec2 = b2.get_periodic_vector()
+                    if pvec2 is None:
+                        continue
+                    if b2.get_distance_to_fiber(c1) < search_threshold:
+                        candidate_centers.append(c1 + pvec2)
+
+        unique_ghost_centers = []
+        for gc in candidate_centers:
+            if np.linalg.norm(gc - self.center) <= dedup_tol:
+                continue
+            if any(
+                np.linalg.norm(gc - existing) <= dedup_tol
+                for existing in unique_ghost_centers
             ):
-                intersected_periodic.append(boundary)
+                continue
+            unique_ghost_centers.append(gc)
 
-        if len(intersected_periodic) == 2:
-            ghost_centers.append(
-                intersected_periodic[0].get_periodic_vector()
-                + intersected_periodic[1].get_periodic_vector()
-                + self.center
-            )
-
-        for ghost_center in ghost_centers:
+        for ghost_center in unique_ghost_centers:
             self.ghost_fibers.append(
                 PeriodicGhostFiber(ghost_center, self.radius, self)
             )
 
     def adjust_for_bounds(self, boundaries: List[LinearBoundary], eps=5.0e-2):
         super().adjust_for_bounds(boundaries, eps)
+        # Wrap primary fiber back into the primary RVE if it drifts completely
+        # across a periodic boundary by more than its own radius.
+        for _ in range(2):
+            wrapped = False
+            for boundary in boundaries:
+                if boundary.type == BoundaryType.PERIODIC and boundary.pair is not None:
+                    if boundary.get_signed_distance(self.center) < -self.radius:
+                        pvec = boundary.get_periodic_vector()
+                        if pvec is not None:
+                            self.move(pvec)
+                            wrapped = True
+            if not wrapped:
+                break
 
     def move(self, move_vec: np.ndarray):
         super().move(move_vec)
@@ -208,22 +254,20 @@ class PeriodicPrimaryFiber(Fiber):
         fiber_center_kd_tree,
         fibers_with_ghosts: List[Fiber],
         fiber_diams_to_search: float,
+        max_fiber_radius: Optional[float] = None,
     ):
         self.neighbors = set()
         self.vec_moved_since_neighbor_update = np.array([0.0, 0.0])
 
-        # KDTree query returns distances and indices
-        dists, indices = fiber_center_kd_tree.query(
-            self.center,
-            k=100,
-            p=2,
-            distance_upper_bound=self.radius * 2.0 * fiber_diams_to_search,
+        other_max_r = max_fiber_radius if max_fiber_radius is not None else self.radius
+        search_dist = (self.radius + other_max_r) * fiber_diams_to_search
+        valid_indices = fiber_center_kd_tree.query_ball_point(
+            self.center, r=search_dist, p=2
         )
 
-        # Filter indices
-        valid_indices = [i for i in indices if i < len(fibers_with_ghosts)]
-
         for i in valid_indices:
+            if i >= len(fibers_with_ghosts):
+                continue
             other = fibers_with_ghosts[i]
             # Check logic from original: neighbors should have higher index to avoid double checking pairs
             if isinstance(other, PeriodicPrimaryFiber):
@@ -235,7 +279,10 @@ class PeriodicPrimaryFiber(Fiber):
 
         for gf in self.ghost_fibers:
             gf.update_neighbors(
-                fiber_center_kd_tree, fibers_with_ghosts, fiber_diams_to_search
+                fiber_center_kd_tree,
+                fibers_with_ghosts,
+                fiber_diams_to_search,
+                max_fiber_radius=max_fiber_radius,
             )
 
     def fix_overlap_with_neighbors(
@@ -272,19 +319,20 @@ class PeriodicGhostFiber(Fiber):
         fiber_center_kd_tree,
         fibers_with_ghosts: List[Fiber],
         fiber_diams_to_search: float,
+        max_fiber_radius: Optional[float] = None,
     ):
         self.neighbors = set()
         self.vec_moved_since_neighbor_update = np.array([0.0, 0.0])
 
-        dists, indices = fiber_center_kd_tree.query(
-            self.center,
-            k=100,
-            p=2,
-            distance_upper_bound=self.radius * 2.0 * fiber_diams_to_search,
+        other_max_r = max_fiber_radius if max_fiber_radius is not None else self.radius
+        search_dist = (self.radius + other_max_r) * fiber_diams_to_search
+        valid_indices = fiber_center_kd_tree.query_ball_point(
+            self.center, r=search_dist, p=2
         )
-        valid_indices = [i for i in indices if i < len(fibers_with_ghosts)]
 
         for i in valid_indices:
+            if i >= len(fibers_with_ghosts):
+                continue
             other = fibers_with_ghosts[i]
             if isinstance(other, PeriodicPrimaryFiber):
                 if other.index > self.primary_fiber.index:

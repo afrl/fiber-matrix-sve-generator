@@ -19,7 +19,7 @@ class FiberPlacementSolver:
         fibers: List[PeriodicPrimaryFiber],
         boundaries: List[LinearBoundary],
         min_spacing_ratio: float,
-        iterations_max: int,
+        iterations_max: int = 10000,
         iteration_callback: Optional[
             Callable[[int, List[PeriodicPrimaryFiber], List[LinearBoundary]], None]
         ] = None,
@@ -52,7 +52,7 @@ class FiberPlacementSolver:
 
         # Calculate average radius for spacing logic
         if not fibers:
-            return
+            return 0
         avg_radius = np.mean([f.radius for f in fibers])
         min_space_between_fibers = (
             min_spacing_ratio * avg_radius * 2.0
@@ -63,9 +63,9 @@ class FiberPlacementSolver:
         iteration_count = 0
         iterations_no_overlap = 0
 
-        # Note: I changed the stopping condition from 3 to 1 to allow faster convergence.
-        # This is likely fine for well-posed problems, but consider adjusting in the future.
-        while iterations_no_overlap < 1 and iteration_count < iterations_max:
+        # Require at least 2 consecutive overlap-free passes so that the fresh
+        # ghost/KDTree rebuild triggered on the first clean pass is verified too.
+        while iterations_no_overlap < 2 and iteration_count < iterations_max:
             if iteration_callback is not None:
                 iteration_callback(iteration_count, fibers, boundaries)
 
@@ -119,9 +119,12 @@ class FiberPlacementSolver:
         fiber_diams_to_search : float
             Search radius multiplier for neighbor finding.
         """
+        if not fibers:
+            return
+        max_fiber_radius = max(f.radius for f in fibers)
         fibers_with_ghosts: List[Fiber] = []
         for fiber in fibers:
-            fiber.calc_ghost_fibers(boundaries)
+            fiber.calc_ghost_fibers(boundaries, max_fiber_radius=max_fiber_radius)
             fibers_with_ghosts.append(fiber)
             fibers_with_ghosts.extend(fiber.ghost_fibers)
 
@@ -130,7 +133,10 @@ class FiberPlacementSolver:
 
         for fiber in fibers:
             fiber.update_neighbors(
-                fiber_center_kd_tree, fibers_with_ghosts, fiber_diams_to_search
+                fiber_center_kd_tree,
+                fibers_with_ghosts,
+                fiber_diams_to_search,
+                max_fiber_radius=max_fiber_radius,
             )
 
     def _iterate_on_interference(

@@ -13,10 +13,11 @@ def square_periodic_example():
     show_guis = False
 
     # Ensure we load data relative to this script's location
-    base_dir = Path(__file__).parent
+    base_dir = Path(__file__).resolve().parent
     # Change working directory to a folder for output
     output_dir = base_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
+    orig_cwd = Path.cwd()
     os.chdir(output_dir)
 
     rve = FiberRVE()
@@ -62,6 +63,8 @@ def square_periodic_example():
         print("Verification PASSED")
     else:
         print("Verification FAILED")
+        os.chdir(orig_cwd)
+        raise AssertionError(f"Verification failed: norm_diff={norm_diff}")
 
     # Test Meshing
     try:
@@ -72,11 +75,8 @@ def square_periodic_example():
             visualize_gui=show_guis,
         )
         print("Meshing call completed (check output files).")
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc()
-        print(f"Meshing failed: {e}")
+    finally:
+        os.chdir(orig_cwd)
 
 
 if __name__ == "__main__":

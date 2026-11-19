@@ -5,8 +5,10 @@ from scipy.spatial import KDTree
 
 try:
     import gmsh
-except ImportError:
+    _gmsh_import_error = None
+except (ImportError, OSError) as exc:
     gmsh = None
+    _gmsh_import_error = exc
 
 from fiber_matrix.models.boundary import BoundaryType, LinearBoundary
 from fiber_matrix.models.fiber import Fiber, PeriodicPrimaryFiber
@@ -27,9 +29,11 @@ class GmshMesher3D:
 
     def _check_gmsh(self):
         if gmsh is None:
+            detail = f" ({_gmsh_import_error})" if _gmsh_import_error is not None else ""
             raise ImportError(
-                "GMSH python library is not installed. Please install it using 'pip install gmsh'."
-            )
+                "GMSH python library is not available or missing system shared libraries"
+                f"{detail}. Please install gmsh ('pip install gmsh') and required OpenGL/X11 libraries."
+            ) from _gmsh_import_error
 
     def create_mesh(
         self,
@@ -112,12 +116,60 @@ class GmshMesher3D:
             elements instead of subdividing into tetrahedra. This can remove
             radial-looking tetrahedral subdivision patterns. Default is False.
         """
+        if not boundaries:
+            raise ValueError("No boundaries provided.")
         if thickness <= 0:
             raise ValueError("thickness must be positive.")
         if z_layers < 1:
             raise ValueError("z_layers must be at least 1.")
 
         gmsh.initialize()
+        try:
+            self._build_and_write_mesh(
+                fibers=fibers,
+                boundaries=boundaries,
+                thickness=thickness,
+                mesh_size_factor=mesh_size_factor,
+                z_layers=z_layers,
+                visualize_gui=visualize_gui,
+                check_periodicity=check_periodicity,
+                periodic_z=periodic_z,
+                surface_groups=surface_groups,
+                composite_surface_groups=composite_surface_groups,
+                anchor_node_groups=anchor_node_groups,
+                uniform_mesh=uniform_mesh,
+                fiber_mesh_size=fiber_mesh_size,
+                matrix_mesh_size=matrix_mesh_size,
+                boundary_mesh_size=boundary_mesh_size,
+                interface_refinement_distance=interface_refinement_distance,
+                boundary_refinement_distance=boundary_refinement_distance,
+                recombine_prisms=recombine_prisms,
+            )
+        finally:
+            if gmsh.isInitialized():
+                gmsh.finalize()
+
+    def _build_and_write_mesh(
+        self,
+        fibers: List[PeriodicPrimaryFiber],
+        boundaries: List[LinearBoundary],
+        thickness: float,
+        mesh_size_factor: float,
+        z_layers: int,
+        visualize_gui: bool,
+        check_periodicity: bool,
+        periodic_z: bool,
+        surface_groups: bool,
+        composite_surface_groups: bool,
+        anchor_node_groups: bool,
+        uniform_mesh: bool,
+        fiber_mesh_size: float,
+        matrix_mesh_size: float,
+        boundary_mesh_size: float,
+        interface_refinement_distance: float,
+        boundary_refinement_distance: float,
+        recombine_prisms: bool,
+    ):
         gmsh.model.add(self.mesh_name)
 
         all_b_points = []
@@ -129,6 +181,8 @@ class GmshMesher3D:
         rve_extent = np.linalg.norm(
             np.max(all_b_points, axis=0) - np.min(all_b_points, axis=0)
         )
+        if rve_extent <= 0:
+            raise ValueError("RVE boundary extent must be positive.")
         scale_factor = 1.0 / rve_extent
 
         ordered_chain = self._order_boundary_chain(boundaries, scale_factor)
@@ -153,11 +207,28 @@ class GmshMesher3D:
         rve_wire = gmsh.model.occ.addWire(occ_line_tags)
         rve_face = gmsh.model.occ.addPlaneSurface([rve_wire])
 
+        coords_min = np.min(all_b_points, axis=0)
+        coords_max = np.max(all_b_points, axis=0)
+        max_r = max((f.radius for f in fibers), default=0.0)
+
+        def overlaps_bbox(f):
+            tol = f.radius * 1.05
+            return not (
+                f.center[0] < coords_min[0] - tol
+                or f.center[0] > coords_max[0] + tol
+                or f.center[1] < coords_min[1] - tol
+                or f.center[1] > coords_max[1] + tol
+            )
+
         fiber_disks = []
         for f in fibers:
-            fiber_disks.append(self._add_fiber_disk(f, scale_factor))
-            for g in f.ghost_fibers:
-                fiber_disks.append(self._add_fiber_disk(g, scale_factor))
+            if hasattr(f, "calc_ghost_fibers"):
+                f.calc_ghost_fibers(boundaries, max_fiber_radius=max_r)
+            if overlaps_bbox(f):
+                fiber_disks.append(self._add_fiber_disk(f, scale_factor))
+            for g in getattr(f, "ghost_fibers", []):
+                if overlaps_bbox(g):
+                    fiber_disks.append(self._add_fiber_disk(g, scale_factor))
 
         gmsh.model.occ.synchronize()
         if visualize_gui:
@@ -165,10 +236,13 @@ class GmshMesher3D:
 
         rve_dimtag = (2, rve_face)
         fiber_dimtags = [(2, tag) for tag in fiber_disks]
-        clipped_fibers_dimtags, _ = gmsh.model.occ.intersect(
-            fiber_dimtags, [rve_dimtag], removeObject=True, removeTool=False
-        )
-        gmsh.model.occ.synchronize()
+        if fiber_dimtags:
+            clipped_fibers_dimtags, _ = gmsh.model.occ.intersect(
+                fiber_dimtags, [rve_dimtag], removeObject=True, removeTool=False
+            )
+            gmsh.model.occ.synchronize()
+        else:
+            clipped_fibers_dimtags = []
 
         refinement_dimtags = []
         if not uniform_mesh:
@@ -190,16 +264,22 @@ class GmshMesher3D:
                 rve_extent,
             )
             refinement_dimtags += self._add_boundary_refinement_partition(
-                all_b_points,
+                ordered_chain,
+                rve_dimtag,
                 scale_factor,
                 boundary_distance,
             )
 
-        out_dimtags, out_dimtags_map = gmsh.model.occ.fragment(
-            [rve_dimtag], clipped_fibers_dimtags + refinement_dimtags
-        )
-        if not out_dimtags_map:
-            raise RuntimeError("GMSH Fragment operation returned an empty map.")
+        tool_dimtags = clipped_fibers_dimtags + refinement_dimtags
+        if tool_dimtags:
+            out_dimtags, out_dimtags_map = gmsh.model.occ.fragment(
+                [rve_dimtag], tool_dimtags
+            )
+            if not out_dimtags_map:
+                raise RuntimeError("GMSH Fragment operation returned an empty map.")
+        else:
+            out_dimtags = [rve_dimtag]
+            out_dimtags_map = [[rve_dimtag]]
 
         fiber_surface_tags = set()
         for i in range(len(clipped_fibers_dimtags)):
@@ -269,7 +349,7 @@ class GmshMesher3D:
         if periodic_z:
             translation = self._translation_matrix(0.0, 0.0, thickness)
             matched_top, matched_bottom = self._get_periodic_surface_mapping(
-                top_surface_tags, bottom_surface_tags, translation, rve_extent
+                top_surface_tags, bottom_surface_tags, translation, max(rve_extent, thickness)
             )
             if matched_top:
                 periodic_surface_pairs.append((matched_top, matched_bottom, translation))
@@ -303,6 +383,7 @@ class GmshMesher3D:
             gmsh.model.mesh.setSize(gmsh.model.getEntities(0), mesh_size_factor)
         elif not uniform_mesh:
             self._apply_material_mesh_sizes(
+                boundaries,
                 all_b_points,
                 thickness,
                 matrix_volume_tags,
@@ -322,19 +403,13 @@ class GmshMesher3D:
         if visualize_gui:
             gmsh.fltk.run()
 
-        periodicity_message = None
         if check_periodicity:
-            self._check_periodicity(periodic_surface_pairs, rve_extent)
-            periodicity_message = self._check_periodicity(periodic_surface_pairs, rve_extent)
+            self._check_periodicity(periodic_surface_pairs, max(rve_extent, thickness))
 
         self._set_periodic_surface_constraints(periodic_surface_pairs)
 
         gmsh.write(self.mesh_name + ".msh")
         gmsh.write(self.mesh_name + ".vtk")
-
-        gmsh.finalize()
-        
-        print(periodicity_message)
 
     def _order_boundary_chain(self, boundaries, scale_factor):
         ordered_chain = []
@@ -350,17 +425,20 @@ class GmshMesher3D:
         while remaining_boundaries:
             found_idx = -1
             found_orientation = 0
+            best_dist = 1e-4
             for i, b in enumerate(remaining_boundaries):
                 p0 = b.points[0] * scale_factor
                 p1 = b.points[1] * scale_factor
-                if np.linalg.norm(p0 - current_end) < 1e-4:
+                d0 = np.linalg.norm(p0 - current_end)
+                d1 = np.linalg.norm(p1 - current_end)
+                if d0 < best_dist:
+                    best_dist = d0
                     found_idx = i
                     found_orientation = 0
-                    break
-                if np.linalg.norm(p1 - current_end) < 1e-4:
+                if d1 < best_dist:
+                    best_dist = d1
                     found_idx = i
                     found_orientation = 1
-                    break
 
             if found_idx == -1:
                 raise RuntimeError(
@@ -414,7 +492,7 @@ class GmshMesher3D:
             raise ValueError("interface_refinement_distance must be positive.")
 
         partition_disks = []
-        min_radius = max(rve_extent * 1e-8, 1e-9)
+        min_radius = max(rve_extent * 1e-8, 1e-15)
         for fiber in self._get_all_fiber_copies(fibers):
             outer_radius = fiber.radius + refinement_distance
             partition_disks.append(
@@ -454,39 +532,88 @@ class GmshMesher3D:
 
     def _add_boundary_refinement_partition(
         self,
-        boundary_points,
+        ordered_chain,
+        rve_dimtag,
         scale_factor,
         boundary_refinement_distance,
     ):
         if boundary_refinement_distance <= 0:
             raise ValueError("boundary_refinement_distance must be positive.")
 
-        coords_min = np.min(boundary_points, axis=0)
-        coords_max = np.max(boundary_points, axis=0)
-        inset_min = coords_min + boundary_refinement_distance
-        inset_max = coords_max - boundary_refinement_distance
-
-        if np.any(inset_min >= inset_max):
+        delta_scaled = boundary_refinement_distance * scale_factor
+        verts = [np.asarray(item[1], dtype=float) for item in ordered_chain]
+        n_verts = len(verts)
+        if n_verts < 3:
             return []
 
-        corners = [
-            (inset_min[0], inset_min[1]),
-            (inset_max[0], inset_min[1]),
-            (inset_max[0], inset_max[1]),
-            (inset_min[0], inset_max[1]),
-        ]
+        signed_area = 0.5 * sum(
+            verts[i][0] * verts[(i + 1) % n_verts][1]
+            - verts[(i + 1) % n_verts][0] * verts[i][1]
+            for i in range(n_verts)
+        )
+        if abs(signed_area) < 1e-15:
+            return []
+        orient = 1.0 if signed_area > 0 else -1.0
+
+        edge_dirs = []
+        inward_normals = []
+        for i in range(n_verts):
+            edge_vec = verts[(i + 1) % n_verts] - verts[i]
+            edge_len = np.linalg.norm(edge_vec)
+            if edge_len <= 1e-12:
+                return []
+            d_i = edge_vec / edge_len
+            n_i = orient * np.array([-d_i[1], d_i[0]])
+            edge_dirs.append(d_i)
+            inward_normals.append(n_i)
+
+        inset_verts = []
+        for i in range(n_verts):
+            prev_idx = (i - 1) % n_verts
+            d_prev = edge_dirs[prev_idx]
+            d_curr = edge_dirs[i]
+            p_prev = verts[i] + delta_scaled * inward_normals[prev_idx]
+            p_curr = verts[i] + delta_scaled * inward_normals[i]
+            denom = d_prev[0] * d_curr[1] - d_prev[1] * d_curr[0]
+            if abs(denom) < 1e-10:
+                inset_verts.append(p_curr)
+            else:
+                diff = p_curr - p_prev
+                t = (diff[0] * d_curr[1] - diff[1] * d_curr[0]) / denom
+                inset_verts.append(p_prev + t * d_prev)
+
+        for i in range(n_verts):
+            inset_edge = inset_verts[(i + 1) % n_verts] - inset_verts[i]
+            if np.dot(inset_edge, edge_dirs[i]) <= 1e-8:
+                return []
+
+        inset_signed_area = 0.5 * sum(
+            inset_verts[i][0] * inset_verts[(i + 1) % n_verts][1]
+            - inset_verts[(i + 1) % n_verts][0] * inset_verts[i][1]
+            for i in range(n_verts)
+        )
+        if inset_signed_area * orient <= 1e-12:
+            return []
+
         point_tags = [
-            gmsh.model.occ.addPoint(x * scale_factor, y * scale_factor, 0)
-            for x, y in corners
+            gmsh.model.occ.addPoint(float(pt[0]), float(pt[1]), 0.0)
+            for pt in inset_verts
         ]
         line_tags = [
-            gmsh.model.occ.addLine(point_tags[i], point_tags[(i + 1) % 4])
-            for i in range(4)
+            gmsh.model.occ.addLine(point_tags[i], point_tags[(i + 1) % n_verts])
+            for i in range(n_verts)
         ]
         wire = gmsh.model.occ.addWire(line_tags)
         face = gmsh.model.occ.addPlaneSurface([wire])
         gmsh.model.occ.synchronize()
-        return [(2, face)]
+        clipped, _ = gmsh.model.occ.intersect(
+            [(2, face)],
+            [rve_dimtag],
+            removeObject=True,
+            removeTool=False,
+        )
+        gmsh.model.occ.synchronize()
+        return [dt for dt in clipped if dt[0] == 2]
 
     def _get_all_fiber_copies(self, fibers):
         all_fibers = []
@@ -523,17 +650,18 @@ class GmshMesher3D:
         return matrix_volume_tags, fiber_volume_tags
 
     def _collect_periodic_surfaces(self, boundaries, rve_extent, thickness):
-        tolerance = rve_extent * 1e-8
+        tolerance = max(rve_extent * 1e-7, 1e-15)
+        z_tolerance = max(thickness * 1e-7, 1e-15)
         side_surface_map = {b: [] for b in boundaries}
         bottom_surface_tags = []
         top_surface_tags = []
 
         for _, tag in gmsh.model.getEntities(2):
             com = np.array(gmsh.model.occ.getCenterOfMass(2, tag))
-            if abs(com[2]) < tolerance:
+            if abs(com[2]) < z_tolerance:
                 bottom_surface_tags.append(tag)
                 continue
-            if abs(com[2] - thickness) < tolerance:
+            if abs(com[2] - thickness) < z_tolerance:
                 top_surface_tags.append(tag)
                 continue
 
@@ -554,7 +682,7 @@ class GmshMesher3D:
     ):
         coords_min = np.min(boundary_points, axis=0)
         coords_max = np.max(boundary_points, axis=0)
-        tolerance = max(rve_extent * 1e-8, 1e-9)
+        tolerance = max(max(rve_extent, thickness) * 1e-7, 1e-15)
         matrix_volume_tags = set(matrix_volume_tags)
         fiber_volume_tags = set(fiber_volume_tags)
         grouped_surfaces = {
@@ -599,7 +727,7 @@ class GmshMesher3D:
     ):
         coords_min = np.min(boundary_points, axis=0)
         coords_max = np.max(boundary_points, axis=0)
-        tolerance = max(rve_extent * 1e-8, 1e-9)
+        tolerance = max(max(rve_extent, thickness) * 1e-7, 1e-15)
         grouped_surfaces = {
             "left": [],
             "right": [],
@@ -624,15 +752,71 @@ class GmshMesher3D:
     def _add_anchor_node_physical_groups(self, boundary_points, thickness, rve_extent):
         coords_min = np.min(boundary_points, axis=0)
         coords_max = np.max(boundary_points, axis=0)
-        tolerance = max(rve_extent * 1e-6, 1e-9)
-        anchors = {
+        tolerance = max(rve_extent * 1e-6, 1e-15)
+        rect_targets = {
             "anchor_xyz": np.array([coords_min[0], coords_min[1], 0.0]),
             "anchor_yz": np.array([coords_max[0], coords_min[1], 0.0]),
             "anchor_z": np.array([coords_min[0], coords_max[1], 0.0]),
         }
 
-        for name, target in anchors.items():
-            point_tag = self._find_nearest_point_entity(target, tolerance)
+        try:
+            anchor_tags = {
+                name: self._find_nearest_point_entity(target, tolerance)
+                for name, target in rect_targets.items()
+            }
+        except RuntimeError:
+            # General polygonal cross-section fallback: select 3 non-collinear z=0 boundary vertices
+            z0_candidates = []
+            unique_bpts = np.unique(np.round(boundary_points, decimals=12), axis=0)
+            for _, tag in gmsh.model.getEntities(0):
+                coords = np.array(gmsh.model.getValue(0, tag, []))
+                if abs(coords[2]) <= tolerance:
+                    dists = np.linalg.norm(unique_bpts - coords[:2], axis=1)
+                    if np.min(dists) <= tolerance * 10.0:
+                        z0_candidates.append((tag, coords))
+
+            if len(z0_candidates) < 3:
+                for _, tag in gmsh.model.getEntities(0):
+                    coords = np.array(gmsh.model.getValue(0, tag, []))
+                    if abs(coords[2]) <= tolerance:
+                        z0_candidates.append((tag, coords))
+
+            if len(z0_candidates) < 3:
+                raise RuntimeError(
+                    "Could not find 3 geometric points on z=0 for anchor node groups."
+                )
+
+            tag_xyz, c_xyz = min(
+                z0_candidates, key=lambda item: (float(item[1][1]), float(item[1][0]))
+            )
+            rem_1 = [item for item in z0_candidates if item[0] != tag_xyz]
+            tag_yz, c_yz = min(
+                rem_1,
+                key=lambda item: (
+                    round(abs(float(item[1][1] - c_xyz[1])) / max(rve_extent, 1e-15), 6),
+                    -float(item[1][0]),
+                ),
+            )
+            base_vec = c_yz[:2] - c_xyz[:2]
+            base_len = np.linalg.norm(base_vec)
+            if base_len <= tolerance:
+                raise RuntimeError("Degenerate anchor points selected on z=0.")
+            rem_2 = [item for item in rem_1 if item[0] != tag_yz]
+            tag_z, _ = max(
+                rem_2,
+                key=lambda item: abs(
+                    base_vec[0] * (item[1][1] - c_xyz[1])
+                    - base_vec[1] * (item[1][0] - c_xyz[0])
+                )
+                / base_len,
+            )
+            anchor_tags = {
+                "anchor_xyz": tag_xyz,
+                "anchor_yz": tag_yz,
+                "anchor_z": tag_z,
+            }
+
+        for name, point_tag in anchor_tags.items():
             group = gmsh.model.addPhysicalGroup(0, [point_tag])
             gmsh.model.setPhysicalName(0, group, name)
 
@@ -680,6 +864,7 @@ class GmshMesher3D:
 
     def _apply_material_mesh_sizes(
         self,
+        boundaries,
         boundary_points,
         thickness,
         matrix_volume_tags,
@@ -709,9 +894,8 @@ class GmshMesher3D:
             if size <= 0:
                 raise ValueError(f"{name} must be positive.")
 
-        coords_min = np.min(boundary_points, axis=0)
-        coords_max = np.max(boundary_points, axis=0)
-        tolerance = max(rve_extent * 1e-8, 1e-9)
+        tolerance = max(rve_extent * 1e-7, 1e-15)
+        z_tolerance = max(thickness * 1e-7, 1e-15)
         matrix_volume_tags = set(matrix_volume_tags)
         fiber_volume_tags = set(fiber_volume_tags)
 
@@ -729,7 +913,15 @@ class GmshMesher3D:
                 interface_points.update(points)
 
             com = np.array(gmsh.model.occ.getCenterOfMass(2, tag))
-            if self._surface_sides(com, coords_min, coords_max, thickness, tolerance):
+            is_exterior = (
+                abs(com[2]) < z_tolerance
+                or abs(com[2] - thickness) < z_tolerance
+                or any(
+                    b.get_distance_to_fiber(np.array(com[:2])) < tolerance
+                    for b in boundaries
+                )
+            )
+            if is_exterior:
                 exterior_points.update(points)
 
         gmsh.option.setNumber("Mesh.Algorithm", 6)
@@ -801,7 +993,7 @@ class GmshMesher3D:
         matched_primary = []
         remaining_primaries = list(primary_tags)
         trans_vec = np.array(translation[3:12:4])
-        tolerance = max(rve_extent * 1e-6, 1e-9)
+        tolerance = max(rve_extent * 1e-5, 1e-15)
 
         for s_tag in secondary_tags:
             s_com = np.array(gmsh.model.occ.getCenterOfMass(2, s_tag))
@@ -824,7 +1016,7 @@ class GmshMesher3D:
         return matched_secondary, matched_primary
 
     def _check_periodicity(self, periodic_surface_pairs, rve_extent):
-        tolerance = max(rve_extent * 1e-6, 1e-9)
+        tolerance = max(rve_extent * 1e-6, 1e-15)
         message = None
         for secondary_tags, primary_tags, translation in periodic_surface_pairs:
             secondary_coords = self._get_unique_surface_nodes(secondary_tags)
